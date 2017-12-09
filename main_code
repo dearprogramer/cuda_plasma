@@ -1,0 +1,372 @@
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+#include <math.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
+#include  "device_functions.h"
+#include <fstream>
+using namespace std;
+const int nx = 512;
+const int ny = 512;
+const float pi = 3.1415926;
+const int times = 1;  //total circle time .循环次数
+const float dt = 0.01;//时间间隔
+const float dx = 0.1;//
+float a[4][nx+2][ny+2];//represent the value of all variables in  time=n 代表n时刻的值
+float b[4][nx][ny];   //represent the value of all variables in  time=n+1代表n+1时刻的值
+float bp[4][nx][ny];  //represent the value of all variables in  time=n-1代表n-1时刻的值
+float ca[4][nx+2][ny+2]; //use to store the a data from gpu 
+float br[4][nx][ny];  //use to store the b data from gpu 
+float rt[times][4];   //store the history of one point in the metrix 储存某个点的历史参数值
+					  //use gpu compute the b in time n+1;计算n+1时刻的值
+__global__ void calcculate(float *a, float *b,float *c)
+{
+	int width = ny;
+	int lenth = nx * ny;
+	int awidth = ny+2;
+	int alenth = (nx+2)* (ny+2);
+	float dt = 0.01;
+	float dx = 0.1;
+	//p
+	int x = blockIdx.x;
+	int y = threadIdx.x;
+	int bl, bc, br, bu, bd, al, ar, au, ad, ac;
+	bc = x*width + (y);
+	ad = (x + 1)*awidth + (y);
+	au = (x + 1)*awidth + (y + 2);
+	ar = (x + 2)*awidth + (y + 1);
+	al = x*awidth + (y + 1);
+	ac = (x + 1)*awidth + (y + 1);
+
+	bc = x*width + (y);
+	ad = (x + 1)*awidth + (y);
+	au = (x + 1)*awidth + (y + 2);
+	ar = (x + 2)*awidth + (y + 1);
+	al = x*awidth + (y + 1);
+	ac = (x + 1)*awidth + (y + 1);
+	b[bc] = -(a[ alenth + ar] - a[alenth + al])*dt/dx
+		-(a[2 * alenth + au] - a[2 * alenth + ad])*dt/dx 
+		+c[bc];
+	b[lenth + bc] = -(a[ar] - a[al])*dt / dx
+		- 2*(a[3 * alenth + ar] + a[3 * alenth + au] + a[3 * alenth + ad] + a[3 * alenth + al] - 4 * a[3 * alenth + ac])*dt / (dx*dx) 
+		+ c[lenth + bc];
+	b[2 * lenth + bc] = -(a[au] - a[ad])*dt / ( dx) + c[2 * lenth + bc];
+	b[3 * lenth + bc] = -a[1 * alenth + ac] * dt + c[3 * lenth + bc];
+	__syncthreads();
+}
+//update all values 更新各个状态量
+__global__ void  updatevalues(float *a, float  *b,float *c)
+{
+	int width = ny;
+	int lenth = nx * ny;
+	int awidth = ny + 2;
+	int alenth = (nx + 2)* (ny + 2);
+	int x = blockIdx.x;
+	int y = threadIdx.x;
+	int bl, bc, br, bu, bd, al, ar, au, ad, ac;
+	bc = x*width + y;
+	ac = (x + 1)*awidth + y + 1;
+	c[bc] = a[ac];
+	c[1 * lenth + bc] = a[1 * alenth + ac];
+	c[2 * lenth + bc] = a[2 * alenth + ac];
+	c[3 * lenth + bc] = a[3 * alenth + ac];
+	__syncthreads();
+	a[ac] = b[bc];
+	a[1 * alenth + ac] = b[1 * lenth + bc];
+	a[2 * alenth + ac] = b[2 * lenth + bc];
+	a[3 * alenth + ac] = b[3 * lenth + bc];
+	__syncthreads();
+}
+//deal with the boundary condition ,边界条件进行处理
+__global__ void initialboundarycondition(float *a, float *b)
+{
+	int m = threadIdx.x;
+
+	int width = ny;
+	int lenth = nx * ny;
+	int awidth = ny + 2;
+	int alenth = (nx + 2)* (ny + 2);
+	int ml, mr, mu, md, nl, nr, nu, nd;
+
+	md = (m + 1)*awidth;//[m+1][0]
+	mu = (m + 2)*awidth - 1;//[m+1][ny+1]
+	ml = m + 1;//[0][m+1]  
+	mr = (awidth - 1)*awidth + m + 1;//[nx+1][m+1]
+	nd = m*width;//[m][0]
+	nu = (m + 1)*width - 1;//[m][ny-1]
+	nl = m;//[0][m]
+	nr = (width - 1)*width + m;//[nx-1][m]
+	//p
+	a[ml] = b[nl];
+	a[mr] = b[nr];
+	a[mu] = b[nu];
+	a[md] = b[nd];
+
+	a[1 * alenth + ml] = 0;
+	a[1 * alenth + mr] = 0;
+	a[1 * alenth + mu] = b[1 * lenth + nu];
+	a[1 * alenth + md] = b[1 * lenth + nd];
+
+	a[2 * alenth + mu] = 0;
+	a[2 * alenth + md] = 0;
+	a[2 * alenth + ml] = b[2 * lenth + nl];
+	a[2 * alenth + +mr] = b[2 * lenth + nr];
+
+	a[3 * alenth + ml] = b[3 * lenth + nl];
+	a[3 * alenth + +mr] = b[3 * lenth + nr];
+	a[3 * alenth + mu] = b[3 * lenth + nu];
+	a[3 * alenth + md] = b[3 * lenth + nd];
+
+	__syncthreads();
+}
+
+void randefloat(float *a, unsigned int size) //generate the random seris of a array;随机产生一组随机数
+{
+	for (int i = 0; i < size; i++)
+	{
+		*(a + i) = (float)rand();
+	}
+}
+void printDeviceProp(int divice_no = 0) //to display information about gpu 展示gpu 信息
+{
+	cudaDeviceProp prop;
+	cudaGetDeviceProperties(&prop, divice_no);
+	printf("Device Name : %s.\n", prop.name);
+	printf("totalGlobalMem : %d.\n", prop.totalGlobalMem);
+	printf("sharedMemPerBlock : %d.\n", prop.sharedMemPerBlock);
+	printf("regsPerBlock : %d.\n", prop.regsPerBlock);
+	printf("warpSize : %d.\n", prop.warpSize);
+	printf("memPitch : %d.\n", prop.memPitch);
+	printf("maxThreadsPerBlock : %d.\n", prop.maxThreadsPerBlock);
+	printf("maxThreadsDim[0 - 2] : %d %d %d.\n", prop.maxThreadsDim[0], prop.maxThreadsDim[1], prop.maxThreadsDim[2]);
+	printf("maxGridSize[0 - 2] : %d %d %d.\n", prop.maxGridSize[0], prop.maxGridSize[1], prop.maxGridSize[2]);
+	printf("totalConstMem : %d.\n", prop.totalConstMem);
+	printf("major.minor : %d.%d.\n", prop.major, prop.minor);
+	printf("clockRate : %d.\n", prop.clockRate);
+	printf("textureAlignment : %d.\n", prop.textureAlignment);
+	printf("deviceOverlap : %d.\n", prop.deviceOverlap);
+	printf("multiProcessorCount : %d.\n", prop.multiProcessorCount);
+
+}
+//use array a and array b to generate a  Metrix like c=aXb 用两个数组产生一个矩阵 C=A X B
+void initialvalue(float *a, float *b, float *c, unsigned int rows, int  cols)
+{
+	for (int i = 0; i < rows; i++)
+	{
+		for (int j = 0; j < cols; j++)
+		{
+			a[i*rows + j] = b[i] * c[j];
+		}
+	}
+}
+//use x as a  axis array to generate a array b use function pfun ,like b=pfun(x) 利用数轴x和函数pfun产生数组b,即b=pfunc(x) 
+void initialfunc(float *x, float *b, int size, float(*pfunc)(float))
+{
+	for (int i = 0; i < size; i++)
+	{
+		float tempx = x[i];
+		b[i] = pfunc(tempx);
+	}
+}
+//set array a all values to zero ；将数组所有的值设为0.
+void zeros(float *a, int size)
+{
+	for (int i = 0; i < size; i++)
+	{
+		a[i] = 0;
+	}
+
+}
+//use cpu to solve equation 利用cpu进行计算
+void cpucompute()
+{
+	int width = ny;
+	int lenth = nx * ny;
+	int awidth = ny + 2;
+	int alenth = (nx + 2)* (ny + 2);
+
+
+	for (int i = 0; i < times; i++)
+	{
+		//p
+		for (int x = 0; x < nx; x++)
+		{
+			for (int y = 0; y < ny; y++)
+			{
+				b[0][x][y] = -(a[1][x+2][y+1] - a[1][x][y + 1])*dt / ( dx)
+					-(a[1][x+1][y+2]-a[1][x+1][y])*dt /(dx)
+					+bp[0][x][y];
+				b[1][x][y] = -(a[0][x + 2][y + 1] - a[0][x][y + 1])*dt/ (dx) 
+					-2*(a[3][x+2][y+1]+a[3][x][y+1] + a[3][x+1][y] + a[3][x+1][y+2]-4* a[3][x+1][y+1])*dt/(dx*dx)
+					+ bp[1][x][y];
+				b[2][x][y] = -(a[0][x + 1][y + 2] - a[0][x + 1][y])*dt / dx + bp[2][x][y];
+				b[3][x][y] = -a[1][x + 1][y + 1] * dt + bp[3][x][y];
+
+			}
+		}
+		
+		for (int x = 0; x < nx; x++)
+		{
+			for (int y = 0; y < ny; y++)
+			{
+				bp[0][x][y] = a[0][x + 1][y + 1];
+				bp[1][x][y] = a[1][x + 1][y + 1];
+				bp[2][x][y] = a[2][x + 1][y+ 1];
+				bp[3][x][y] = a[3][x + 1][y + 1];
+				a[0][x + 1][y + 1] = b[0][x][y];
+				a[1][x + 1][y + 1] = b[1][x][y];
+				a[2][x + 1][y+ 1] = b[2][x][y];
+				a[3][x + 1][y + 1] = b[3][x][y];				
+			}
+		}
+
+        
+		for (int m = 0; m < nx; m++)
+		{
+			a[0][0][m+1] = b[0][0][m];
+			a[0][nx + 1][m + 1] = b[0][nx-1][m];
+			a[0][m + 1][ny + 1] = b[0][m][ny-1];
+			a[0][m + 1][0] = b[0][m][0];
+
+			a[1][0][m + 1] = 0;
+			a[1][nx + 1][m + 1] = 0;
+			a[1][m + 1][ny+1] = b[1][m][ny-1];
+			a[1][m + 1][0] = b[1][m][0];
+			
+			a[2][0][m + 1] = b[2][0][m];
+			a[2][nx + 1][m + 1] = b[2][nx-1][m];
+			a[2][m + 1][ny+1] = 0;
+			a[2][m + 1][0] = 0;
+
+			a[3][0][m + 1] = b[3][0][m];
+			a[3][nx + 1][m + 1] = b[3][nx-1][m];
+			a[3][m + 1][ny+1] = b[3][m][ny-1];
+			a[3][m + 1][0] = b[3][m][0];
+		}
+		int pointx = 256;
+		int pointy = 256;
+		rt[i][0] = a[0][pointx][pointy];
+		rt[i][1] = a[1][pointx][pointy];
+		rt[i][2] = a[2][pointx][pointy];
+		rt[i][3] = a[3][pointx][pointy];
+	}
+}
+//compare two results,calcutate total erro 比较两个结果，计算总体误差。  
+float caculateErro(float *a, float *b, int size)
+{
+	float total, erro;
+	total = 0;
+	erro = 0;
+	for (int i = 0; i < size; i++)
+	{
+		total = (a[i] + b[i])*(a[i] + b[i]) + total;
+		erro = (a[i] - b[i])*(a[i] - b[i]) + erro;
+	}
+	return  sqrt(erro / total);
+}
+int main()
+{
+	int bdatasize = 4 * nx*ny*sizeof(float);  //b data's size ；变量b数据大小
+	int adatasize = 4 * (nx + 2)*(ny + 2)*sizeof(float);//a data's size；变量a数据大小
+	float *d_a;
+	float *d_b;
+	float *d_bp;
+	float cputime, gputime;
+	float erro1;
+	//generate  the initial value of all vairables ；产生所有变量的初始值。
+	float axis[nx + 2];
+	float ax[nx + 2];
+	float ay[nx + 2];
+	zeros(&b[0][0][0], 4 * nx*ny);
+	zeros(&a[0][0][0], 4 * (nx + 2)*(ny + 2));
+	zeros(&bp[0][0][0], 4 * (nx)*(ny));
+	for (int i = 0; i<nx + 2; i++)
+	{
+
+		ax[i] = sin(i * 2 * pi / (1.0*(nx + 1)));
+		ay[i] = 1.0;
+	}
+	int awidth = ny + 2;
+	int alenth = (nx + 2)* (ny + 2);
+	initialvalue(&a[1][0][0], ax, ay, nx + 2, ny + 2);
+	for (int i = 0; i < nx; i++)
+	{
+		for (int j = 0; j < ny; j++)
+		{
+			bp[0][i][j] = a[0][i + 1][j + 1];
+			bp[1][i][j] = a[1][i + 1][j + 1];
+			bp[2][i][j] = a[2][i + 1][j + 1];
+			bp[3][i][j] = a[3][i + 1][j + 1];
+		}
+	}
+	//use gpu to calculate ;利用gpu 进行计算。
+
+	dim3 Dimgrid(nx);//set grid size;设置grid 大小
+	dim3 Dimblock(ny);//set block size;设置 block 大小
+	cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+
+	//we allocate memary in  gpu .在gpu上分配存储。
+	cudaMalloc((void **)&d_b, bdatasize);
+	cudaMalloc((void **)&d_a, adatasize);
+	cudaMalloc((void **)&d_bp, bdatasize);
+
+	//copy data to gpu.将数据复制到gpu 上。
+	cudaMemcpy(d_a, a, adatasize, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_b, b, bdatasize, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_bp, bp, bdatasize, cudaMemcpyHostToDevice);
+	//compute the equation .计算方程。
+	cudaEventRecord(start, 0);
+	for (int t = 0; t < times; t++)
+	{
+		calcculate << <Dimgrid, Dimblock >> >(d_a, d_b,d_bp);
+		cudaThreadSynchronize();
+		updatevalues << <Dimgrid, Dimblock >> >(d_a, d_b,d_bp);
+		cudaThreadSynchronize();
+		initialboundarycondition << <1, nx >> >(d_a, d_b);
+		cudaThreadSynchronize();	
+	}
+	cudaEventRecord(stop, 0);
+	cudaEventSynchronize(stop);
+
+	//calcutate the time use in gpu .计算在gpu中花费的时间。
+	float duringtime;
+	cudaEventElapsedTime(&duringtime, start, stop);
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+	cudaMemcpy(ca, d_a, adatasize, cudaMemcpyDeviceToHost);
+	cudaMemcpy(br, d_b, bdatasize, cudaMemcpyDeviceToHost);
+
+	//release the gpu memory .释放gpu内存。
+	cudaFree(d_a);
+	cudaFree(d_b);
+	cudaFree(d_bp);
+
+	//use cpu to compute the equation .用cpu进行计算
+	clock_t startc, endc;
+	startc = clock();
+	cpucompute();
+	endc = clock();
+	//计算cpu 花费的时间
+	cputime = (float)(endc - startc)*1000.0 / CLOCKS_PER_SEC;
+	//compute the erro between the result of  cpu and gpu ，计算gpu和cpu结果误差
+	erro1 = caculateErro(&a[0][0][0], &ca[0][0][0], nx*ny * 4);
+	//print the reslult .打印结果
+	printDeviceProp();
+	printf( " parameter is :\n nx:%d, ny:%d, circle times:%d, dt:%f , dx:%f \n", nx, ny,times, dt, dx);
+	printf("erro:%f , cpu time:%f , gputime:%f", erro1, cputime, duringtime);
+	
+	//we save one point's  variable history .记录一个点状态的历史轨迹。 
+	ofstream SaveFile("data.txt");
+	for (int i = 0; i < times; i++)
+	{
+		SaveFile << i << " " << rt[i][0] << " " << rt[i][1] << " " << rt[i][2] << " " << rt[i][3] << endl;
+	}
+	SaveFile.close();
+	//avoid the display windows close automatically.防止显示窗口自动关闭
+	int s = 0;
+	scanf("%d", &s);
+#
+}
